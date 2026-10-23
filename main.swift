@@ -62,18 +62,23 @@ func shortCount(_ n: Int) -> String { n >= 1_000_000 ? String(format: "%.1fM", D
 
 // MARK: sprite
 
+/// Sprite frames, one PNG each in Resources/. closed/half/open are the mouth while talking; the rest are face poses.
+enum Pose: String, CaseIterable { case closed, half, open, blink_half, blink_closed, read, yawn, smile, surprised }
+
 final class Sprite {
-    let frames: [NSImage]          // closed, half, open
+    let frames: [Pose: NSImage]
     let aspect: CGFloat
-    private let w: Int, h: Int, mask: [Bool]   // opaque pixels of frame 0, for click-through
+    private let w: Int, h: Int, mask: [Bool]   // opaque pixels of the neutral frame, for click-through
     init() {
         let res = Bundle.main.resourceURL!
-        frames = ["closed", "half", "open"].map { NSImage(contentsOf: res.appendingPathComponent("\($0).png"))! }
-        let rep = NSBitmapImageRep(data: frames[0].tiffRepresentation!)!
-        w = rep.pixelsWide; h = rep.pixelsHigh; aspect = CGFloat(w) / CGFloat(h)
-        var m = [Bool](repeating: false, count: w * h)
-        for y in 0..<h { for x in 0..<w { m[y * w + x] = (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 } }
-        mask = m
+        frames = Dictionary(uniqueKeysWithValues: Pose.allCases.map { ($0, NSImage(contentsOf: res.appendingPathComponent("\($0.rawValue).png"))!) })
+        let cg = frames[.closed]!.cgImage(forProposedRect: nil, context: nil, hints: nil)!
+        w = cg.width; h = cg.height; aspect = CGFloat(w) / CGFloat(h)
+        var alpha = [UInt8](repeating: 0, count: w * h)   // draw into an alpha-only buffer: one pass, no per-pixel objects
+        let ctx = CGContext(data: &alpha, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                            space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)!
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        mask = alpha.map { $0 > 25 }
     }
     func opaque(atUnit p: CGPoint) -> Bool {   // p in 0...1, origin bottom-left
         let x = Int(p.x * CGFloat(w)), y = Int((1 - p.y) * CGFloat(h))
@@ -88,7 +93,7 @@ final class PetWindow: NSWindow {
 final class PetView: NSView {
     let sprite: Sprite
     var spriteHeight: CGFloat = 240
-    var frameIndex = 0 { didSet { if frameIndex != oldValue { needsDisplay = true } } }
+    var pose = Pose.closed { didSet { if pose != oldValue { needsDisplay = true } } }
     var bob: CGFloat = 0 { didSet { if bob != oldValue { needsDisplay = true } } }   // whole pixels only
     var onClick: (() -> Void)?
     var onMoved: (() -> Void)?
@@ -103,7 +108,7 @@ final class PetView: NSView {
     }
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.current?.imageInterpolation = .high
-        sprite.frames[frameIndex].draw(in: spriteRect)
+        sprite.frames[pose]!.draw(in: spriteRect)
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         let p = convert(point, from: superview)
@@ -427,7 +432,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         return f
     }()
     let pollQueue = DispatchQueue(label: "pet.monitor"); var polling = false
-    var talkTimer: Timer?, bubbleTimer: Timer?, t: Double = 0
+    var bubbleTimer: Timer?, t: Double = 0
     var waiting = false              // sent a message, no text back yet: the bubble shows animated dots
     var wasWorking = false, agentStep = "", otherActivity = ""
     var pending: [(id: String, title: String, input: [String: Any])] = []
@@ -509,26 +514,46 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         bubble.frame = NSRect(x: 4, y: y, width: w - 8, height: min(bubble.fittingHeight(width: w - 8), room))
     }
 
-    func tick() {   // 30fps: slow breathing bob, waiting dots
+    func tick() {   // 30fps: slow breathing bob, waiting dots, pixel animation
         t += 1 / 30
         view.bob = (CGFloat(sin(t * 2 * .pi / 3.2) + 1) * view.spriteHeight * 0.006).rounded()
         if waiting && Int(t * 30) % 12 == 0 { bubble.string = String(repeating: "·", count: Int(t * 2.5) % 3 + 1) }
-    }
-
-    func talk(_ steps: Int) {   // flap the mouth for `steps` × 90ms
-        talkTimer?.invalidate()
-        var n = 0
-        talkTimer = Timer.scheduledTimer(withTimeInterval: 0.09, repeats: true) { [weak self] tm in
-            n += 1
-            self?.view.frameIndex = n >= steps ? 0 : [0, 1, 2, 1][n % 4]
-            if n >= steps { tm.invalidate() }
+        if !anim.isEmpty && t >= animStepEnd {
+            anim.removeFirst()
+            animStepEnd = t + (anim.first?.1 ?? 0)
         }
+        view.pose = anim.first?.0 ?? .closed
+        if anim.isEmpty && t >= nextIdle { idleAnimation(); nextIdle = t + .random(in: 2.5...6) }
     }
 
-    /// Show `text` in the bubble for `hold` seconds (it also stays while the input is open or Claude is working).
-    func say(_ text: String, hold: TimeInterval? = nil) {
+    // pixel animation: one sequence of (pose, seconds) at a time, stepped by tick(); then back to the neutral face.
+    // A sequence of equal or higher priority replaces the current one; a lower one is dropped.
+    enum Priority: Int { case idle, expression, talk }
+    var anim: [(Pose, Double)] = [], animPriority = Priority.idle, animStepEnd = 0.0, nextIdle = 2.0
+    func play(_ seq: [(Pose, Double)], _ priority: Priority) {
+        guard !seq.isEmpty, anim.isEmpty || priority.rawValue >= animPriority.rawValue else { return }
+        anim = seq; animPriority = priority; animStepEnd = t + seq[0].1
+    }
+    func talking(_ steps: Int) -> [(Pose, Double)] {   // mouth flap, 90ms per frame
+        (0..<steps).map { ([Pose.closed, .half, .open, .half][$0 % 4], 0.09) }
+    }
+    let blink: [(Pose, Double)] = [(.blink_half, 0.05), (.blink_closed, 0.08), (.blink_half, 0.05)]
+    lazy var idleActions: [(chance: Double, seq: [(Pose, Double)])] = [
+        (0.06, [(.blink_half, 0.08), (.yawn, 1.4), (.blink_half, 0.1)]),                    // rare yawn
+        (0.14, [(.read, 2.2)] + blink + [(.read, 2.4), (.blink_half, 0.06)]),               // read the book a moment
+        (0.10, blink + [(.closed, 0.15)] + blink),                                          // double blink
+        (0.70, blink),
+    ]
+    func idleAnimation() {   // pick one idle action by its chance
+        var r = Double.random(in: 0..<1)
+        for a in idleActions { r -= a.chance; if r < 0 { play(a.seq, .idle); return } }
+    }
+
+    /// Show `text` in the bubble for `hold` seconds (it also stays while the input is open or Claude is working),
+    /// moving the mouth; `then` plays right after the talking.
+    func say(_ text: String, hold: TimeInterval? = nil, then: [(Pose, Double)] = []) {
         bubble.string = text; bubble.isHidden = false; layoutOverlays()
-        talk(min(8 + text.count / 2, 60))
+        play(talking(min(8 + text.count / 2, 60)) + then, .talk)
         bubbleTimer?.invalidate()
         bubbleTimer = Timer.scheduledTimer(withTimeInterval: hold ?? max(4, Double(text.count) / 12), repeats: true) { [weak self] tm in
             guard let self else { return }
@@ -575,7 +600,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
     func showCard() {
         if let p = pending.first {
             card.label.stringValue = "\(agent.target.name) wants to run:\n\(p.title)"
-            window.orderFrontRegardless(); talk(10)
+            window.orderFrontRegardless(); play([(.surprised, 1.2)], .talk)
         }
         layoutOverlays()
     }
@@ -610,7 +635,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         let working = fresh && (act?.working ?? false)
         otherActivity = working ? "\(act!.project): \(act!.detail)" : ""
         if wasWorking && !working, let a = act, fresh, a.last.timeIntervalSince(a.since) > 20, !agent.busy {
-            say("Done in \(a.project). Your turn.")
+            say("Done in \(a.project). Your turn.", then: [(.smile, 2.5)])
         }
         wasWorking = working
         refreshPill()

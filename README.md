@@ -13,6 +13,7 @@ A small pixel-art Claude that lives on your macOS desktop. You can chat with it,
   Attaching to a session that is still open in a terminal or IDE forks it: both continue from the same history.
 - **Claude Code activity.** While a session is working, a small label above the pet's head shows the project and the current step (for example `my-app: Bash · Run tests`). When a task that ran for more than 20 seconds finishes, the pet tells you.
 - **Open in Terminal.** Lists the Claude Code sessions from the last 7 days (project, title, time). Pick one and Terminal opens in that directory and runs `claude --resume` for it. - **Usage.** The menu-bar ✦ shows today's output tokens. The menu breaks usage down per account (output, input including cache, number of sessions) and shows the context size of the latest session.
+- **Pixel animation.** She blinks every few seconds. Now and then she reads her book, and very rarely she yawns. She smiles when a Claude Code task finishes and looks surprised when a permission card pops up. Every pose is a full pixel-art frame with only the eyes and mouth changed, so nothing gets stretched.
 - Drag the pet to move it. The transparent area around the character is click-through. Sizes are Small, Medium and Large. It can stay on top, shows on every desktop, and has no Dock icon.
 
 Activity and usage come from reading the local transcripts in `~/.claude/projects/**/*.jsonl`. Nothing is sent anywhere. The only network traffic is the chat, which goes through your own `claude` CLI.
@@ -41,7 +42,7 @@ defaults write io.github.kirigirihitomi.claude-pixel-pet configDirs -array ~/.cl
 |---|---|
 | `main.swift` | the whole app (AppKit, no dependencies) |
 | `build.sh` | compiles with `swiftc` and packages the `.app` |
-| `Resources/` | sprite frames: mouth closed / half / open |
+| `Resources/` | sprite frames: mouth closed / half / open, plus face poses (blinks, reading, yawn, smile, surprised) |
 | `tools/defringe.py` | cleans leftover white background out of the hair in a cut-out sprite; `--face` protects a region, `--fill-face-holes` repairs punched-out eye whites (numpy, scipy, Pillow) |
 
 ## License
