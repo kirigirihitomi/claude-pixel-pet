@@ -10,6 +10,7 @@ A small pixel-art Claude that lives on your macOS desktop. You can chat with it,
 
 - **Chat.** Click the pet and type; press Enter to send and Esc to close. Replies come from a persistent headless Claude Code session (`claude -p --resume`) with all tools disabled. Use "New chat" in the menu to start over.
 - **Claude Code activity.** While a session is working, a small label above the pet's head shows the project and the current step (for example `my-app: Bash · Run tests`). When a task that ran for more than 20 seconds finishes, the pet tells you.
+- **Resume.** The menu's "Resume in Terminal" lists the Claude Code sessions from the last 7 days (project, title, time). Pick one and Terminal opens in that directory and runs `claude --resume` for it. Your chat with the pet is listed there too, so you can continue it with full Claude Code.
 - **Usage.** The menu-bar ✦ shows today's output tokens. The menu breaks usage down per account (output, input including cache, number of sessions) and shows the context size of the latest session.
 - Drag the pet to move it. The transparent area around the character is click-through. Sizes are Small, Medium and Large. It can stay on top, shows on every desktop, and has no Dock icon.
 

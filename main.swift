@@ -172,6 +172,49 @@ final class Monitor {
     }
 }
 
+// MARK: recent sessions, for "Resume" (reads only the tail of each transcript)
+
+struct Session { let id: String; let dir: URL; let cwd: String; let title: String; let modified: Date }
+
+func recentSessions(days: Double = 7, limit: Int = 12) -> [Session] {
+    let cutoff = Date().addingTimeInterval(-days * 86400)
+    var found: [Session] = []
+    for (_, dir) in accounts {
+        guard let e = FileManager.default.enumerator(at: dir.appendingPathComponent("projects"),
+                                                    includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+        for case let url as URL in e where url.pathExtension == "jsonl" && !url.path.contains("/subagents/") {
+            let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            guard mod > cutoff, let h = try? FileHandle(forReadingFrom: url) else { continue }
+            let size = (try? h.seekToEnd()) ?? 0
+            try? h.seek(toOffset: size > 262_144 ? size - 262_144 : 0)
+            let tail = (try? h.readToEnd()) ?? Data(); try? h.close()
+            var cwd = "", title = "", prompt = ""
+            for line in tail.split(separator: 0x0A) {
+                guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                if let c = j["cwd"] as? String { cwd = c }
+                if let t = (j["customTitle"] ?? j["aiTitle"]) as? String { title = t }
+                if let t = j["lastPrompt"] as? String { prompt = t }
+            }
+            guard !cwd.isEmpty else { continue }
+            found.append(Session(id: url.deletingPathExtension().lastPathComponent, dir: dir, cwd: cwd,
+                                 title: title.isEmpty ? String(prompt.prefix(40)) : title, modified: mod))
+        }
+    }
+    return Array(found.sorted { $0.modified > $1.modified }.prefix(limit))
+}
+
+/// Opens Terminal in the session's directory and runs `claude --resume` there (a .command file needs no extra permissions).
+func resumeInTerminal(_ s: Session) {
+    let q = { (x: String) in "'" + x.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let script = "#!/bin/zsh -l\ncd \(q(s.cwd)) && CLAUDE_CONFIG_DIR=\(q(s.dir.path)) exec claude --resume \(s.id)\n"
+    let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("claude-pixel-pet")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appendingPathComponent("resume-\(s.id.prefix(8)).command")
+    try? script.write(to: file, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+    NSWorkspace.shared.open(file)
+}
+
 // MARK: chat with a persistent headless session
 
 final class Chat {
@@ -212,7 +255,7 @@ final class Chat {
 
 // MARK: app
 
-final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate {
     let sprite = Sprite(), monitor = Monitor(), chat = Chat()
     var window: PetWindow!, view: PetView!, status: NSStatusItem!
     let bubble = pill(12, .medium, alpha: 0.96), statusPill = pill(10, .regular, alpha: 0.75)
@@ -349,6 +392,8 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         m.addItem(.separator())
         m.addItem(withTitle: "Chat…", action: #selector(openChat), keyEquivalent: "")
         m.addItem(withTitle: "New chat", action: #selector(newChat), keyEquivalent: "")
+        let resume = m.addItem(withTitle: "Resume in Terminal", action: nil, keyEquivalent: "")
+        resume.submenu = NSMenu(); resume.submenu!.delegate = self
         m.addItem(.separator())
         for (i, (name, _)) in sizes.enumerated() {
             let it = m.addItem(withTitle: name, action: #selector(pickSize(_:)), keyEquivalent: ""); it.tag = i
@@ -364,6 +409,22 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
     @objc func openChat() { if input.isHidden { toggleInput() } }
     @objc func newChat() { chat.sessionID = nil; say("Fresh start.") }
+
+    var sessions: [Session] = []
+    func menuNeedsUpdate(_ menu: NSMenu) {   // the Resume submenu is rebuilt each time it opens
+        menu.removeAllItems()
+        sessions = recentSessions()
+        let rel = RelativeDateTimeFormatter(); rel.unitsStyle = .short
+        for (i, s) in sessions.enumerated() {
+            let mine = s.id == chat.sessionID
+            let name = mine ? "Pet chat" : "\((s.cwd as NSString).lastPathComponent) — \(s.title.isEmpty ? s.id.prefix(8) : Substring(s.title))"
+            let it = menu.addItem(withTitle: "\(name)  ·  \(rel.localizedString(for: s.modified, relativeTo: Date()))",
+                                  action: #selector(resumeSession(_:)), keyEquivalent: "")
+            it.target = self; it.tag = i
+        }
+        if sessions.isEmpty { menu.addItem(withTitle: "No sessions in the last 7 days", action: nil, keyEquivalent: "") }
+    }
+    @objc func resumeSession(_ item: NSMenuItem) { resumeInTerminal(sessions[item.tag]) }
     @objc func pickSize(_ s: NSMenuItem) { resize(sizes[s.tag].1) }
     @objc func toggleTop(_ s: NSMenuItem) {
         window.level = window.level == .floating ? .normal : .floating
