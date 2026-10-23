@@ -8,7 +8,8 @@ Rules for any agent (Claude Code session or otherwise) that changes this repo.
 3. Update `README.md` if user-visible behaviour or setup changed.
 4. Commit with a short imperative subject that says what changed for the user.
 5. **Before merging, run `/simplify` on the PR's whole diff and apply what it finds.** If that changes code, build and check the running app again. Docs-only PRs skip this step. Merging without it has happened before. Don't.
-6. Squash-merge, so `main` gets one commit per PR.
+6. **Every PR gets a code review before merging, including the maintainer's own.** Run `/code-review` on code PRs, fix or answer each finding, and leave the summary as a PR comment. Docs-only PRs get a careful read-through. Open PRs are checked every couple of hours.
+7. Squash-merge, so `main` gets one commit per PR.
 
 ## Code
 - One file, `main.swift`, AppKit only, built with `swiftc` and no package manager or dependencies. Keep it that way unless there is a strong reason.
