@@ -203,10 +203,17 @@ func recentSessions(days: Double = 7, limit: Int = 12) -> [Session] {
     return Array(found.sorted { $0.modified > $1.modified }.prefix(limit))
 }
 
+/// CLAUDE_CONFIG_DIR value for a config dir. The default ~/.claude must stay unset: setting it explicitly makes
+/// Claude Code look up a different stored login, and it asks you to log in again.
+func configEnv(_ dir: URL) -> String? {
+    dir.standardizedFileURL.path == home.appendingPathComponent(".claude").standardizedFileURL.path ? nil : dir.path
+}
+
 /// Opens Terminal in the session's directory and runs `claude --resume` there (a .command file needs no extra permissions).
 func resumeInTerminal(_ s: Session) {
     let q = { (x: String) in "'" + x.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-    let script = "#!/bin/zsh -l\ncd \(q(s.cwd)) && CLAUDE_CONFIG_DIR=\(q(s.dir.path)) exec claude --resume \(s.id)\n"
+    let env = configEnv(s.dir).map { "CLAUDE_CONFIG_DIR=\(q($0)) " } ?? "unset CLAUDE_CONFIG_DIR; "
+    let script = "#!/bin/zsh -l\ncd \(q(s.cwd)) && \(env)exec claude --resume \(s.id)\n"
     let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("claude-pixel-pet")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let file = dir.appendingPathComponent("resume-\(s.id.prefix(8)).command")
@@ -271,7 +278,7 @@ final class Agent {
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.arguments = ["-lc", "exec claude \"$@\"", "claude"] + args     // login shell: PATH from the user's profile
         var env = ProcessInfo.processInfo.environment
-        if let dir = target.dir ?? accounts.first?.1 { env["CLAUDE_CONFIG_DIR"] = dir.path }
+        env["CLAUDE_CONFIG_DIR"] = (target.dir ?? accounts.first?.1).flatMap(configEnv)
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
         p.environment = env
         p.currentDirectoryURL = URL(fileURLWithPath: target.cwd)
