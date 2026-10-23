@@ -42,7 +42,7 @@ defaults write io.github.kirigirihitomi.claude-pixel-pet configDirs -array ~/.cl
 | `main.swift` | the whole app (AppKit, no dependencies) |
 | `build.sh` | compiles with `swiftc` and packages the `.app` |
 | `Resources/` | sprite frames: mouth closed / half / open |
-| `tools/defringe.py` | cleans leftover white background out of the hair in the sprites (numpy, scipy, Pillow) |
+| `tools/defringe.py` | cleans leftover white background out of the hair in a cut-out sprite; `--face` protects a region, `--fill-face-holes` repairs punched-out eye whites (numpy, scipy, Pillow) |
 
 ## License
 
