@@ -2,17 +2,19 @@
 
 Rules for any agent (Claude Code session or otherwise) that changes this repo.
 
-## Before every commit
-1. **Run `/simplify` on the diff first and apply what it finds.** This includes small changes and follow-up fixes. Pushing without it has happened before. Don't.
+## Workflow
+1. Every change goes through a pull request: work on a branch, push it, and open a PR against `main`. No direct pushes to `main`. The PR description is the record of what changed and why.
 2. Build and run it: `./build.sh` builds, installs to `~/Applications/ClaudePet.app`, and relaunches. Check the actual behaviour in the running app, not just that it compiles.
 3. Update `README.md` if user-visible behaviour or setup changed.
-4. Commit with a short imperative subject that says what changed for the user. Push to `origin`.
+4. Commit with a short imperative subject that says what changed for the user.
+5. **Before merging, run `/simplify` on the PR's whole diff and apply what it finds.** If that changes code, build and check the running app again. Docs-only PRs skip this step. Merging without it has happened before. Don't.
+6. Squash-merge, so `main` gets one commit per PR.
 
 ## Code
 - One file, `main.swift`, AppKit only, built with `swiftc` and no package manager or dependencies. Keep it that way unless there is a strong reason.
 - Match the surrounding style: dense, few comments, shared helpers over copy-paste.
 - Animation: frames are the `Pose` enum and must exist as `Resources/<pose>.png`. Everything goes through `play(_:_:)` with a `Priority` (talk > expression > idle), driven by the single 30 fps `tick()`. Do not add separate timers.
-- Claude Code integration reads transcripts under the config dirs in user defaults (`configDirs`, default `~/.claude-personal`, `~/.claude`). Never set `CLAUDE_CONFIG_DIR` to the default dir, because that makes Claude Code report "Not logged in".
+- Claude Code integration reads transcripts under the config dirs in user defaults (`configDirs`, default `~/.claude`). Never set `CLAUDE_CONFIG_DIR` to the default dir, because that makes Claude Code report "Not logged in".
 - Don't block the main thread with file scans or process launches.
 
 ## Art
