@@ -8,10 +8,11 @@ A small pixel-art Claude that lives on your macOS desktop. You can chat with it,
 
 ## What it does
 
-- **Chat.** Click the pet and type; press Enter to send and Esc to close. Replies come from a persistent headless Claude Code session (`claude -p --resume`) with all tools disabled. Use "New chat" in the menu to start over.
+- **Chat, or drive a real session.** Click the pet and type; press Enter to send and Esc to close. By default you're in "Pet chat", a session of its own with no tools. Use "Switch session" in the menu to attach to any recent Claude Code session, or start a new one in a folder. The pet then runs Claude Code there with its normal tools. When a tool needs approval, a card pops up above the pet's head with **Allow / Deny**. Your own permission settings still apply. "Stop" interrupts the current turn.
+  Under the hood this is the same stream-json protocol the IDE extensions use: one long-lived `claude -p --input-format stream-json --output-format stream-json --permission-prompt-tool stdio` process per attached session.
+  Attaching to a session that is still open in a terminal or IDE forks it: both continue from the same history.
 - **Claude Code activity.** While a session is working, a small label above the pet's head shows the project and the current step (for example `my-app: Bash · Run tests`). When a task that ran for more than 20 seconds finishes, the pet tells you.
-- **Resume.** The menu's "Resume in Terminal" lists the Claude Code sessions from the last 7 days (project, title, time). Pick one and Terminal opens in that directory and runs `claude --resume` for it. Your chat with the pet is listed there too, so you can continue it with full Claude Code.
-- **Usage.** The menu-bar ✦ shows today's output tokens. The menu breaks usage down per account (output, input including cache, number of sessions) and shows the context size of the latest session.
+- **Open in Terminal.** Lists the Claude Code sessions from the last 7 days (project, title, time). Pick one and Terminal opens in that directory and runs `claude --resume` for it. - **Usage.** The menu-bar ✦ shows today's output tokens. The menu breaks usage down per account (output, input including cache, number of sessions) and shows the context size of the latest session.
 - Drag the pet to move it. The transparent area around the character is click-through. Sizes are Small, Medium and Large. It can stay on top, shows on every desktop, and has no Dock icon.
 
 Activity and usage come from reading the local transcripts in `~/.claude/projects/**/*.jsonl`. Nothing is sent anywhere. The only network traffic is the chat, which goes through your own `claude` CLI.
@@ -46,6 +47,6 @@ defaults write io.github.kirigirihitomi.claude-pixel-pet configDirs -array ~/.cl
 ## License
 
 - **Code** (`main.swift`, `build.sh`, `tools/`): MIT. See `LICENSE`.
-- **Character art** (`Resources/`, `docs/preview.png`): derived from the Claude character design by **ZipZipPipe (胖次狐)**, which is published under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). The 3-heads-tall pixel version is a derivative work under the same license. **No commercial use.** See `LICENSE-ART`.
+- **Character art** (`Resources/`, `docs/preview.png`): derived from the Claude character design by **ZipZipPipe**, which is published under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). The 3-heads-tall pixel version is a derivative work under the same license. **No commercial use.** See `LICENSE-ART`.
 
 This is a fan project. It is not affiliated with or endorsed by Anthropic. "Claude" is a trademark of Anthropic.

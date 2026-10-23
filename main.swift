@@ -215,57 +215,196 @@ func resumeInTerminal(_ s: Session) {
     NSWorkspace.shared.open(file)
 }
 
-// MARK: chat with a persistent headless session
+// MARK: talking to Claude Code: one long-lived `claude -p` process per attached session, stream-json both ways
+// (the same protocol the IDE extensions use; tool permission requests arrive as control_request can_use_tool)
 
-final class Chat {
-    var sessionID: String? {
-        get { UserDefaults.standard.string(forKey: "chatSession") }
-        set { UserDefaults.standard.set(newValue, forKey: "chatSession") }
-    }
-    var busy = false
+struct Target {
+    var id: String?            // session id; nil = start a new one
+    var cwd: String
+    var dir: URL?              // Claude Code config dir
+    var tools: Bool            // false = plain chat with the pet (no tools, pet persona)
+    var name: String
+}
 
-    func send(_ text: String, done: @escaping (String) -> Void) {
+final class Agent {
+    enum Event { case text(String), step(String), permission(id: String, title: String, input: [String: Any]), done(String), failed(String) }
+    var target: Target
+    var onEvent: (Event) -> Void = { _ in }
+    var onSession: (String) -> Void = { _ in }
+    private(set) var busy = false
+    private var proc: Process?, stdin: FileHandle?, buffer = Data()
+
+    init(target: Target) { self.target = target }
+
+    func attach(_ t: Target) { stop(); target = t }
+
+    func send(_ text: String) {
+        if proc?.isRunning != true { start() }
         busy = true
-        let resume = sessionID != nil
-        let id = sessionID ?? UUID().uuidString.lowercased()
-        var args = ["-p", text, "--output-format", "json", "--tools", "", "--disable-slash-commands",
-                    "--append-system-prompt", persona]
-        args += resume ? ["--resume", id] : ["--session-id", id]
+        write(["type": "user", "message": ["role": "user", "content": text]])
+    }
+
+    func answer(permission id: String, allow: Bool, input: [String: Any]) {
+        let r: [String: Any] = allow ? ["behavior": "allow", "updatedInput": input] : ["behavior": "deny", "message": "The user declined this from the desktop pet."]
+        write(["type": "control_response", "response": ["subtype": "success", "request_id": id, "response": r]])
+    }
+
+    func interrupt() {
+        guard busy else { return }
+        write(["type": "control_request", "request_id": UUID().uuidString, "request": ["subtype": "interrupt"]])
+    }
+
+    func stop() { try? stdin?.close(); proc?.terminate(); proc = nil; stdin = nil; busy = false; buffer = Data() }
+
+    private func write(_ o: [String: Any]) {
+        guard let d = try? JSONSerialization.data(withJSONObject: o) else { return }
+        try? stdin?.write(contentsOf: d + Data([0x0A]))
+    }
+
+    private func start() {
+        var args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                    "--permission-prompt-tool", "stdio"]
+        if let id = target.id { args += ["--resume", id] }
+        else { let id = UUID().uuidString.lowercased(); target.id = id; args += ["--session-id", id]; onSession(id) }
+        if !target.tools { args += ["--tools", "", "--disable-slash-commands", "--append-system-prompt", persona] }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.arguments = ["-lc", "exec claude \"$@\"", "claude"] + args     // login shell: PATH from the user's profile
         var env = ProcessInfo.processInfo.environment
-        if let dir = accounts.first?.1 { env["CLAUDE_CONFIG_DIR"] = dir.path }
+        if let dir = target.dir ?? accounts.first?.1 { env["CLAUDE_CONFIG_DIR"] = dir.path }
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
         p.environment = env
-        p.currentDirectoryURL = home
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-        p.terminationHandler = { [weak self] _ in
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            var reply = "…I lost my train of thought. Try again?"
-            if let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if let r = j["result"] as? String, !r.isEmpty { reply = r }
-                if let sid = j["session_id"] as? String { DispatchQueue.main.async { self?.sessionID = sid } }
-            }
-            DispatchQueue.main.async { self?.busy = false; done(reply.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        p.currentDirectoryURL = URL(fileURLWithPath: target.cwd)
+        let inPipe = Pipe(), outPipe = Pipe()
+        p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = Pipe()
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            DispatchQueue.main.async { self?.consume(d) }
         }
-        do { try p.run(); if !resume { sessionID = id } } catch { busy = false; done("I can't find the claude command.") }
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.proc === p else { return }
+                if self.busy { self.onEvent(.failed("The claude process stopped.")) }
+                self.proc = nil; self.stdin = nil; self.busy = false
+            }
+        }
+        do { try p.run(); proc = p; stdin = inPipe.fileHandleForWriting }
+        catch { onEvent(.failed("I can't find the claude command.")) }
+    }
+
+    private func consume(_ d: Data) {
+        buffer += d
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = buffer[buffer.startIndex..<nl]; buffer = Data(buffer[(nl + 1)...])
+            guard let m = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            handle(m)
+        }
+    }
+
+    private func handle(_ m: [String: Any]) {
+        switch m["type"] as? String {
+        case "system":
+            if let sid = m["session_id"] as? String, sid != target.id { target.id = sid; onSession(sid) }
+        case "assistant":
+            let content = (m["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+            for c in content {
+                if c["type"] as? String == "text", let t = c["text"] as? String, !t.isEmpty { onEvent(.text(t)) }
+                if c["type"] as? String == "tool_use" {
+                    onEvent(.step(describe(c["name"] as? String ?? "tool", c["input"] as? [String: Any] ?? [:])))
+                }
+            }
+        case "control_request":
+            guard let id = m["request_id"] as? String, let r = m["request"] as? [String: Any] else { return }
+            if r["subtype"] as? String == "can_use_tool" {
+                let input = r["input"] as? [String: Any] ?? [:]
+                onEvent(.permission(id: id, title: describe(r["tool_name"] as? String ?? "tool", input, full: true), input: input))
+            } else {
+                write(["type": "control_response", "response": ["subtype": "error", "request_id": id, "error": "not supported by the pet"]])
+            }
+        case "result":
+            busy = false
+            onEvent(.done((m["result"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)))
+        default: break
+        }
+    }
+
+    func describe(_ tool: String, _ input: [String: Any], full: Bool = false) -> String {
+        let detail = (full ? input["command"] as? String : nil) ?? (input["description"] as? String) ?? (input["command"] as? String)
+            ?? (input["file_path"] as? String).map { full ? $0 : ($0 as NSString).lastPathComponent }
+            ?? (input["pattern"] as? String) ?? (input["url"] as? String) ?? ""
+        let s = detail.isEmpty ? tool : "\(tool) · \(detail)"
+        return String(s.prefix(full ? 300 : 70))
+    }
+}
+
+/// Scrollable, selectable speech bubble (long replies scroll instead of being cut off).
+final class BubbleView: NSScrollView {
+    let text = NSTextView()
+    init() {
+        super.init(frame: .zero)
+        drawsBackground = true; backgroundColor = NSColor(white: 1, alpha: 0.96); hasVerticalScroller = true
+        autohidesScrollers = true; borderType = .noBorder; wantsLayer = true; layer?.cornerRadius = 8; isHidden = true
+        text.isEditable = false; text.isSelectable = true; text.drawsBackground = false
+        text.font = .systemFont(ofSize: 12, weight: .medium); text.textColor = NSColor(white: 0.15, alpha: 1)
+        text.textContainerInset = NSSize(width: 6, height: 5); text.isVerticallyResizable = true
+        text.autoresizingMask = [.width]; text.textContainer?.widthTracksTextView = true
+        documentView = text
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    var string: String { get { text.string } set { text.string = newValue; text.scrollToBeginningOfDocument(nil) } }
+    func fittingHeight(width: CGFloat) -> CGFloat {
+        text.frame.size.width = width
+        guard let lm = text.layoutManager, let tc = text.textContainer else { return 30 }
+        lm.ensureLayout(for: tc)
+        return lm.usedRect(for: tc).height + 12
+    }
+}
+
+/// "Claude wants to run …  [Deny] [Allow]"
+final class PermissionCard: NSView {
+    let label = NSTextField(wrappingLabelWithString: "")
+    let allow = NSButton(title: "Allow", target: nil, action: nil), deny = NSButton(title: "Deny", target: nil, action: nil)
+    var onAnswer: (Bool) -> Void = { _ in }
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true; layer?.cornerRadius = 8; layer?.backgroundColor = NSColor(calibratedRed: 1, green: 0.97, blue: 0.9, alpha: 0.97).cgColor
+        label.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular); label.maximumNumberOfLines = 5
+        allow.bezelStyle = .rounded; deny.bezelStyle = .rounded; allow.keyEquivalent = "\r"
+        allow.target = self; allow.action = #selector(yes); deny.target = self; deny.action = #selector(no)
+        [label, allow, deny].forEach(addSubview); isHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc func yes() { onAnswer(true) }
+    @objc func no() { onAnswer(false) }
+    override func layout() {
+        super.layout()
+        allow.frame = NSRect(x: bounds.width - 76, y: 4, width: 70, height: 26)
+        deny.frame = NSRect(x: bounds.width - 150, y: 4, width: 70, height: 26)
+        label.frame = NSRect(x: 8, y: 32, width: bounds.width - 16, height: bounds.height - 36)
     }
 }
 
 // MARK: app
 
 final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate {
-    let sprite = Sprite(), monitor = Monitor(), chat = Chat()
+    let sprite = Sprite(), monitor = Monitor()
     var window: PetWindow!, view: PetView!, status: NSStatusItem!
-    let bubble = pill(12, .medium, alpha: 0.96), statusPill = pill(10, .regular, alpha: 0.75)
+    let bubble = BubbleView(), statusPill = pill(10, .regular, alpha: 0.8), card = PermissionCard()
     let input = NSTextField()
     let pollQueue = DispatchQueue(label: "pet.monitor"); var polling = false
     var talkTimer: Timer?, bubbleUntil = Date.distantPast, t: Double = 0
-    var wasWorking = false, thinkingDots = 0
-    let headroom: CGFloat = 170
+    var wasWorking = false, thinkingDots = 0, agentStep = ""
+    var pending: [(id: String, title: String, input: [String: Any])] = []
+    let headroom: CGFloat = 230
     let sizes: [(String, CGFloat)] = [("Small", 160), ("Medium", 240), ("Large", 340)]
     var height: CGFloat { CGFloat(UserDefaults.standard.object(forKey: "height") as? Double ?? 240) }
+
+    var petChatID: String? {
+        get { UserDefaults.standard.string(forKey: "chatSession") }
+        set { UserDefaults.standard.set(newValue, forKey: "chatSession") }
+    }
+    func petChat() -> Target { Target(id: petChatID, cwd: home.path, dir: accounts.first?.1, tools: false, name: "Pet chat") }
+    lazy var agent = Agent(target: petChat())
 
     func applicationDidFinishLaunching(_ n: Notification) {
         window = PetWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
@@ -274,11 +413,15 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         window.level = UserDefaults.standard.object(forKey: "onTop") as? Bool ?? true ? .floating : .normal
         view = PetView(sprite: sprite); view.onClick = { [weak self] in self?.toggleInput() }
         window.contentView = view
-        input.placeholderString = "Say something…"; input.isHidden = true; input.delegate = self
+        input.isHidden = true; input.delegate = self
         input.focusRingType = .none; input.bezelStyle = .roundedBezel; input.font = .systemFont(ofSize: 12)
-        [statusPill, bubble, input].forEach { view.addSubview($0) }
-        monitor.ignoreSession = { [weak self] in self?.chat.sessionID }
+        [statusPill, bubble, card, input].forEach { view.addSubview($0) }
+        card.onAnswer = { [weak self] ok in self?.answerPermission(ok) }
+        agent.onEvent = { [weak self] e in self?.agentEvent(e) }
+        agent.onSession = { [weak self] id in if self?.agent.target.tools == false { self?.petChatID = id } }
+        monitor.ignoreSession = { [weak self] in self?.agent.target.id }
         resize(height, keepBottom: false)
+        updatePlaceholder()
         window.orderFrontRegardless()
         setupMenu()
         Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in self?.tick() }
@@ -288,7 +431,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
     }
 
     func resize(_ h: CGFloat, keepBottom: Bool = true) {
-        let w = max(h * sprite.aspect, 260), total = h + headroom
+        let w = max(h * sprite.aspect, 300), total = h + headroom
         var origin: NSPoint
         if keepBottom { origin = NSPoint(x: window.frame.midX - w / 2, y: window.frame.minY) }
         else if let s = UserDefaults.standard.string(forKey: "origin") { origin = NSPointFromString(s) }
@@ -300,24 +443,28 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         UserDefaults.standard.set(Double(h), forKey: "height")
     }
 
-    func layoutBubble() {   // bubble sits on the input (or the head) and grows upward with the text
-        let w = window.frame.width, base = view.spriteHeight + (input.isHidden ? 6 : 32)
-        for (f, maxH) in [(bubble, headroom - 40), (statusPill, CGFloat(32))] {
-            let fit = f.sizeThatFits(NSSize(width: w - 24, height: .greatestFiniteMagnitude))
-            f.frame = NSRect(x: 4, y: base, width: w - 8, height: min(fit.height + 8, maxH))
-        }
+    func layoutBubble() {   // stacked upward from the head: [input] [status] [card or bubble]
+        let w = window.frame.width
+        var y = view.spriteHeight + (input.isHidden ? 6 : 32)
+        let fit = statusPill.sizeThatFits(NSSize(width: w - 24, height: .greatestFiniteMagnitude))
+        statusPill.frame = NSRect(x: 4, y: y, width: w - 8, height: min(fit.height + 6, 30))
+        if !statusPill.isHidden { y += statusPill.frame.height + 4 }
+        let room = view.spriteHeight + headroom - y - 4
+        card.frame = NSRect(x: 4, y: y, width: w - 8, height: min(130, room))
+        bubble.frame = NSRect(x: 4, y: y, width: w - 8, height: min(bubble.fittingHeight(width: w - 8), room))
     }
 
-    func tick() {   // slow breathing bob
+    func tick() {   // slow breathing bob; the bubble stays up while the input box is open or Claude is working
         t += 1 / 30
         view.bob = CGFloat(sin(t * 2 * .pi / 3.2) + 1) * view.spriteHeight * 0.006
-        // the bubble stays up while the input box is open
-        if !bubble.isHidden && Date() > bubbleUntil && !chat.busy && input.isHidden { bubble.isHidden = true; layoutBubble() }
-        statusPill.isHidden = statusPill.stringValue.isEmpty || !bubble.isHidden
+        if !bubble.isHidden && Date() > bubbleUntil && !agent.busy && input.isHidden { bubble.isHidden = true }
+        if !card.isHidden { bubble.isHidden = true }
+        let pillHidden = statusPill.stringValue.isEmpty
+        if statusPill.isHidden != pillHidden { statusPill.isHidden = pillHidden; layoutBubble() }
     }
 
     func say(_ text: String, hold: TimeInterval? = nil) {
-        bubble.stringValue = text; bubble.isHidden = false; layoutBubble()
+        bubble.string = text; bubble.isHidden = !card.isHidden; layoutBubble()
         bubbleUntil = Date().addingTimeInterval(hold ?? max(4, Double(text.count) / 12))
         talkTimer?.invalidate()
         var n = 0
@@ -329,8 +476,10 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
             if n >= steps { tm.invalidate() }
         }
     }
+    func readTime(_ s: String) -> TimeInterval { 15 + Double(s.count) / 4 }   // ~4 CJK chars/s, plus slack
 
-    // chat
+    // input
+    func updatePlaceholder() { input.placeholderString = "Message \(agent.target.name)…" }
     func toggleInput() {
         if !input.isHidden { closeInput(); return }
         input.isHidden = false; layoutBubble()
@@ -341,15 +490,50 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         if sel == #selector(NSResponder.cancelOperation(_:)) { closeInput(); return true }
         guard sel == #selector(NSResponder.insertNewline(_:)) else { return false }
         let text = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !chat.busy else { return true }
+        guard !text.isEmpty, !agent.busy else { return true }
         input.stringValue = ""
-        thinkingDots = 0; say("…", hold: 600)
-        // replies stay ~4 CJK chars/s of reading time, plus slack
-        chat.send(text) { [weak self] reply in self?.say(reply, hold: 15 + Double(reply.count) / 4) }
+        thinkingDots = 0; agentStep = ""; say("·", hold: 3600)
+        agent.send(text)
         return true
     }
 
-    // Claude Code activity
+    // agent events
+    func agentEvent(_ e: Agent.Event) {
+        switch e {
+        case .text(let s): say(s, hold: 3600)
+        case .step(let s): agentStep = s
+        case .permission(let id, let title, let input):
+            pending.append((id, title, input)); showCard()
+        case .done(let s):
+            agentStep = ""
+            if !s.isEmpty { say(s, hold: readTime(s)) } else { bubbleUntil = Date().addingTimeInterval(readTime(bubble.string)) }
+        case .failed(let s): agentStep = ""; say(s)
+        }
+        refreshPill()
+    }
+    func showCard() {
+        guard let p = pending.first else { card.isHidden = true; layoutBubble(); return }
+        card.label.stringValue = "\(agent.target.name) wants to run:\n\(p.title)"
+        card.isHidden = false; bubble.isHidden = true; layoutBubble()
+        window.orderFrontRegardless()
+        say("May I?", hold: 2); bubble.isHidden = true
+    }
+    func answerPermission(_ ok: Bool) {
+        guard !pending.isEmpty else { return }
+        let p = pending.removeFirst()
+        agent.answer(permission: p.id, allow: ok, input: p.input)
+        showCard()
+    }
+
+    // status pill: the attached session's step, otherwise whatever other Claude Code session is busy
+    var otherActivity = ""
+    func refreshPill() {
+        if agent.busy { statusPill.stringValue = agentStep.isEmpty ? "\(agent.target.name): thinking" : "\(agent.target.name): \(agentStep)" }
+        else { statusPill.stringValue = otherActivity }
+        layoutBubble()
+    }
+
+    // Claude Code activity in other sessions
     func pollActivity() {
         if !polling {   // the first scan of big transcripts can take longer than the 2s tick
             polling = true
@@ -359,20 +543,20 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
                 DispatchQueue.main.async { self.polling = false; self.show(act, rows) }
             }
         }
-        if chat.busy { thinkingDots = (thinkingDots + 1) % 3; bubble.stringValue = String(repeating: "·", count: thinkingDots + 1) }
+        if agent.busy && card.isHidden && bubble.string.allSatisfy({ $0 == "·" }) {
+            thinkingDots = (thinkingDots + 1) % 3; bubble.string = String(repeating: "·", count: thinkingDots + 1)
+        }
     }
 
     func show(_ act: Activity?, _ rows: [(String, Int, Int, Int)]) {
         let fresh = act.map { Date().timeIntervalSince($0.last) < 600 } ?? false
-        if let a = act, fresh, a.working {
-            statusPill.stringValue = "\(a.project): \(a.detail)"
-        } else { statusPill.stringValue = "" }
         let working = fresh && (act?.working ?? false)
-        if wasWorking && !working, let a = act, fresh, a.last.timeIntervalSince(a.since) > 20 {
+        otherActivity = working ? "\(act!.project): \(act!.detail)" : ""
+        if wasWorking && !working, let a = act, fresh, a.last.timeIntervalSince(a.since) > 20, !agent.busy {
             say("Done in \(a.project). Your turn.")
         }
         wasWorking = working
-        layoutBubble()
+        refreshPill()
         let total = rows.reduce(0) { $0 + $1.2 }
         status.button?.title = total > 0 ? "✦ \(short(total))" : "✦"
         usageItems.forEach { status.menu?.removeItem($0) }
@@ -384,16 +568,19 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
 
     // menu
     var usageItems: [NSMenuItem] = []
+    var sessionLabel: NSMenuItem!, switchMenu = NSMenu(), terminalMenu = NSMenu()
     func setupMenu() {
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.title = "✦"
         let m = NSMenu()
         m.addItem(withTitle: "Today's usage (output tokens in the icon)", action: nil, keyEquivalent: "")
         m.addItem(.separator())
+        sessionLabel = m.addItem(withTitle: "", action: nil, keyEquivalent: "")
         m.addItem(withTitle: "Chat…", action: #selector(openChat), keyEquivalent: "")
-        m.addItem(withTitle: "New chat", action: #selector(newChat), keyEquivalent: "")
-        let resume = m.addItem(withTitle: "Resume in Terminal", action: nil, keyEquivalent: "")
-        resume.submenu = NSMenu(); resume.submenu!.delegate = self
+        m.addItem(withTitle: "Switch session", action: nil, keyEquivalent: "").submenu = switchMenu
+        m.addItem(withTitle: "Stop", action: #selector(stopAgent), keyEquivalent: "")
+        m.addItem(withTitle: "Open in Terminal", action: nil, keyEquivalent: "").submenu = terminalMenu
+        switchMenu.delegate = self; terminalMenu.delegate = self
         m.addItem(.separator())
         for (i, (name, _)) in sizes.enumerated() {
             let it = m.addItem(withTitle: name, action: #selector(pickSize(_:)), keyEquivalent: ""); it.tag = i
@@ -405,26 +592,54 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         m.addItem(withTitle: "About", action: #selector(about), keyEquivalent: "")
         m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         m.items.forEach { if $0.action != nil && $0.action != #selector(NSApplication.terminate(_:)) { $0.target = self } }
+        m.delegate = self
         status.menu = m
     }
-    @objc func openChat() { if input.isHidden { toggleInput() } }
-    @objc func newChat() { chat.sessionID = nil; say("Fresh start.") }
 
     var sessions: [Session] = []
-    func menuNeedsUpdate(_ menu: NSMenu) {   // the Resume submenu is rebuilt each time it opens
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === status.menu { sessionLabel.title = "Talking to: \(agent.target.name)\(agent.target.tools ? "" : " (no tools)")"; return }
         menu.removeAllItems()
         sessions = recentSessions()
         let rel = RelativeDateTimeFormatter(); rel.unitsStyle = .short
-        for (i, s) in sessions.enumerated() {
-            let mine = s.id == chat.sessionID
-            let name = mine ? "Pet chat" : "\((s.cwd as NSString).lastPathComponent) — \(s.title.isEmpty ? s.id.prefix(8) : Substring(s.title))"
-            let it = menu.addItem(withTitle: "\(name)  ·  \(rel.localizedString(for: s.modified, relativeTo: Date()))",
-                                  action: #selector(resumeSession(_:)), keyEquivalent: "")
-            it.target = self; it.tag = i
+        let toTerminal = menu === terminalMenu
+        if !toTerminal {
+            let it = menu.addItem(withTitle: "Pet chat (no tools)", action: #selector(switchToPetChat), keyEquivalent: "")
+            it.target = self; it.state = agent.target.tools ? .off : .on
+            menu.addItem(.separator())
         }
-        if sessions.isEmpty { menu.addItem(withTitle: "No sessions in the last 7 days", action: nil, keyEquivalent: "") }
+        for (i, s) in sessions.enumerated() where s.id != petChatID {
+            let it = menu.addItem(withTitle: "\(label(s))  ·  \(rel.localizedString(for: s.modified, relativeTo: Date()))",
+                                  action: toTerminal ? #selector(openInTerminal(_:)) : #selector(switchSession(_:)), keyEquivalent: "")
+            it.target = self; it.tag = i; it.state = s.id == agent.target.id ? .on : .off
+        }
+        if !toTerminal {
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "New session in folder…", action: #selector(newSessionInFolder), keyEquivalent: "").target = self
+        }
     }
-    @objc func resumeSession(_ item: NSMenuItem) { resumeInTerminal(sessions[item.tag]) }
+    func label(_ s: Session) -> String {
+        "\((s.cwd as NSString).lastPathComponent) — \(s.title.isEmpty ? String(s.id.prefix(8)) : String(s.title.prefix(40)))"
+    }
+    func switchTo(_ t: Target) {
+        agent.attach(t); pending = []; card.isHidden = true; agentStep = ""
+        updatePlaceholder(); refreshPill()
+        say(t.tools ? "Attached to \(t.name). I can use tools here; I'll ask before anything risky." : "Back to our chat.")
+    }
+    @objc func switchToPetChat() { switchTo(petChat()) }
+    @objc func switchSession(_ item: NSMenuItem) {
+        let s = sessions[item.tag]
+        switchTo(Target(id: s.id, cwd: s.cwd, dir: s.dir, tools: true, name: label(s)))
+    }
+    @objc func newSessionInFolder() {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        switchTo(Target(id: nil, cwd: url.path, dir: accounts.first?.1, tools: true, name: url.lastPathComponent))
+    }
+    @objc func openInTerminal(_ item: NSMenuItem) { resumeInTerminal(sessions[item.tag]) }
+    @objc func stopAgent() { agent.interrupt() }
+    @objc func openChat() { if input.isHidden { toggleInput() } }
     @objc func pickSize(_ s: NSMenuItem) { resize(sizes[s.tag].1) }
     @objc func toggleTop(_ s: NSMenuItem) {
         window.level = window.level == .floating ? .normal : .floating
@@ -435,9 +650,10 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
     @objc func about() {
         let a = NSAlert()
         a.messageText = "Claude desktop pet"
-        a.informativeText = "Character: ZipZipPipe (胖次狐) original design; 3-heads-tall pixel version is a derivative work. CC BY-NC-SA 4.0. Non-commercial. Not affiliated with Anthropic."
+        a.informativeText = "Character: ZipZipPipe original design; 3-heads-tall pixel version is a derivative work. CC BY-NC-SA 4.0. Non-commercial. Not affiliated with Anthropic."
         NSApp.activate(ignoringOtherApps: true); a.runModal()
     }
+    func applicationWillTerminate(_ n: Notification) { agent.stop() }
 }
 
 let app = NSApplication.shared
