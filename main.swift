@@ -268,7 +268,8 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     func tick() {   // slow breathing bob
         t += 1 / 30
         view.bob = CGFloat(sin(t * 2 * .pi / 3.2) + 1) * view.spriteHeight * 0.006
-        if !bubble.isHidden && Date() > bubbleUntil && !chat.busy && input.isHidden {   // stays up while chatting bubble.isHidden = true; layoutBubble() }
+        // the bubble stays up while the input box is open
+        if !bubble.isHidden && Date() > bubbleUntil && !chat.busy && input.isHidden { bubble.isHidden = true; layoutBubble() }
         statusPill.isHidden = statusPill.stringValue.isEmpty || !bubble.isHidden
     }
 
@@ -300,7 +301,8 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         guard !text.isEmpty, !chat.busy else { return true }
         input.stringValue = ""
         thinkingDots = 0; say("…", hold: 600)
-        chat.send(text) { [weak self] reply in self?.say(reply, hold: 15 + Double(reply.count) / 4)   // ~4 CJK chars/s reading speed, plus slack }
+        // replies stay ~4 CJK chars/s of reading time, plus slack
+        chat.send(text) { [weak self] reply in self?.say(reply, hold: 15 + Double(reply.count) / 4) }
         return true
     }
 
