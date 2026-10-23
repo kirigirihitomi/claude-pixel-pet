@@ -22,6 +22,6 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 EOF
 codesign -s - --force "$APP" >/dev/null
 mkdir -p ~/Applications && rm -rf ~/Applications/ClaudePet.app && cp -R "$APP" ~/Applications/
-pkill -x ClaudePet || true
+pkill -x ClaudePet && while pgrep -x ClaudePet >/dev/null; do sleep 0.2; done || true
 open ~/Applications/ClaudePet.app
 echo "installed ~/Applications/ClaudePet.app"
