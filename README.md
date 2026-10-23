@@ -6,6 +6,17 @@ A small pixel-art Claude that lives on your macOS desktop. You can chat with it,
 
 <img src="docs/preview.png" width="220" alt="preview">
 
+## Usage
+
+| | |
+|---|---|
+| Click the pet | open the input box; Enter sends, Esc closes |
+| Right-click the pet | usage panel: plan limits, today's tokens, what's running |
+| Drag the pet | move it (clicks on the transparent area around her go through) |
+| Menu-bar ✦ | Chat, Switch session, Stop, Open in Terminal, size, Always on top, Hide / Show, Quit |
+
+**Stop** interrupts the turn the pet is running right now, like Esc in Claude Code. The session stays attached, so you can send the next message. Sessions open in your terminal or IDE are not affected.
+
 ## What it does
 
 - **Chat, or drive a real session.** Click the pet and type; press Enter to send and Esc to close. By default you're in "Pet chat", a session of its own with no tools. Use "Switch session" in the menu to attach to any recent Claude Code session, or start a new one in a folder. The pet then runs Claude Code there with its normal tools. When a tool needs approval, a card pops up above the pet's head with **Allow / Deny**. Your own permission settings still apply. "Stop" interrupts the current turn.
@@ -18,7 +29,7 @@ A small pixel-art Claude that lives on your macOS desktop. You can chat with it,
 - **Pixel animation.** She blinks every few seconds. Now and then she reads her book, and very rarely she yawns. She smiles when a Claude Code task finishes and looks surprised when a permission card pops up. Every pose is a full pixel-art frame with only the eyes and mouth changed, so nothing gets stretched.
 - Drag the pet to move it. The transparent area around the character is click-through. Sizes are Small, Medium and Large. It can stay on top, shows on every desktop, and has no Dock icon.
 
-Activity and usage come from reading the local transcripts in `~/.claude/projects/**/*.jsonl`. Nothing is sent anywhere. Network traffic is the chat, which goes through your own `claude` CLI, and, while the usage panel is open, at most one request a minute per account to `api.anthropic.com/api/oauth/usage` (the endpoint Claude Code's own `/usage` calls) with that account's login. The token is read from the keychain and not stored anywhere else. That endpoint is undocumented, so the plan limits can stop working after a Claude Code update.
+Activity and today's tokens come from reading the local transcripts in `~/.claude/projects/**/*.jsonl`. The only network traffic is the chat, which goes through your own `claude` CLI, and, while the usage panel is open, at most one request a minute per account to `api.anthropic.com/api/oauth/usage` (the endpoint Claude Code's own `/usage` calls) with that account's login. The token is read from the keychain and not stored anywhere else. That endpoint is undocumented, so the plan limits can stop working after a Claude Code update.
 
 ## Build
 
@@ -32,7 +43,7 @@ To start it at login, add it in System Settings → General → Login Items.
 
 ### Several Claude Code accounts
 
-If you keep more than one config dir (for example with `CLAUDE_CONFIG_DIR`), list them in order. The first one is also used for chat.
+Only `~/.claude` is watched by default. If you keep more than one config dir (for example with `CLAUDE_CONFIG_DIR`), list them in order. The first one is also used for chat.
 
 ```sh
 defaults write io.github.kirigirihitomi.claude-pixel-pet configDirs -array ~/.claude-personal ~/.claude
