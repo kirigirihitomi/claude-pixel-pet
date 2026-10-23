@@ -2,6 +2,7 @@
 // Click to chat or drive a Claude Code session, drag to move. Shows what Claude Code sessions are doing
 // (read from the local transcripts) and today's token usage in the menu-bar icon. Transparent pixels are click-through.
 import AppKit
+import CryptoKit
 
 let home = FileManager.default.homeDirectoryForCurrentUser
 // Claude Code config dirs whose transcripts are watched; the first one is also used for chat.
@@ -58,6 +59,8 @@ func transcripts(since: Date, subagents: Bool) -> [(label: String, dir: URL, url
     return out
 }
 
+let isoFrac: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+let isoPlain = ISO8601DateFormatter()
 func shortCount(_ n: Int) -> String { n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1e6) : n >= 1000 ? "\(n / 1000)k" : "\(n)" }
 
 // MARK: sprite
@@ -97,6 +100,7 @@ final class PetView: NSView {
     var bob: CGFloat = 0 { didSet { if bob != oldValue { needsDisplay = true } } }   // whole pixels only
     var onClick: (() -> Void)?
     var onMoved: (() -> Void)?
+    var onRightClick: (() -> Void)?
     private var dragStart: NSPoint?, moved = false
 
     init(sprite: Sprite) { self.sprite = sprite; super.init(frame: .zero) }
@@ -128,6 +132,7 @@ final class PetView: NSView {
         if moved { onMoved?() } else { onClick?() }
         dragStart = nil
     }
+    override func rightMouseDown(with e: NSEvent) { onRightClick?() }
 }
 
 // MARK: Claude Code activity + usage, read from ~/.claude*/projects/**/*.jsonl
@@ -142,7 +147,6 @@ final class Monitor {
     private var dayStart = Date.distantPast
     private var usage: [String: (input: Int, output: Int, sessions: Set<String>)] = [:]
     var ignoreSession: () -> String? = { nil }          // the session the pet itself is attached to
-    private let iso: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
     // only user/assistant lines matter; skip everything else (huge tool results, snapshots…) before parsing
     private let wanted = [Data(#""type":"user""#.utf8), Data(#""type":"assistant""#.utf8)]
 
@@ -172,7 +176,7 @@ final class Monitor {
         let session = url.deletingPathExtension().lastPathComponent
         for j in takeJSONLines(&st.rest, keep: { line in self.wanted.contains { line.range(of: $0) != nil } }) {
             guard let type = j["type"] as? String, type == "user" || type == "assistant",
-                  let ts = (j["timestamp"] as? String).flatMap(iso.date) else { continue }
+                  let ts = (j["timestamp"] as? String).flatMap(isoFrac.date) else { continue }
             let msg = j["message"] as? [String: Any] ?? [:]
             let content = msg["content"] as? [[String: Any]] ?? []
             if let cwd = j["cwd"] as? String { st.act.project = (cwd as NSString).lastPathComponent }
@@ -417,6 +421,51 @@ final class PermissionCard: NSView {
     }
 }
 
+// MARK: plan limits (the percentages /usage shows), from the endpoint Claude Code itself calls
+
+struct Limit { let name: String; let used: Double; let resets: Date? }
+struct LimitError: Error { let text: String }
+
+/// Keychain item holding a config dir's login, named the way Claude Code names it:
+/// "Claude Code-credentials", plus "-<first 8 hex of sha256(dir)>" for a non-default CLAUDE_CONFIG_DIR.
+func keychainService(_ dir: URL) -> String {
+    guard let env = configEnv(dir) else { return "Claude Code-credentials" }
+    let hash = SHA256.hash(data: Data(env.precomposedStringWithCanonicalMapping.utf8)).map { String(format: "%02x", $0) }.joined()
+    return "Claude Code-credentials-\(hash.prefix(8))"
+}
+
+/// Fetches the plan limits for one account; `done` runs on a background queue. Best-effort: this reads Claude Code's
+/// private credential layout and an undocumented endpoint. The first keychain read asks the user to allow it.
+func planLimits(_ dir: URL, done: @escaping (Result<[Limit], LimitError>) -> Void) {
+    // account = the user name, as Claude Code stores it; older stray items with other accounts can share the service name
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService(dir),
+                            kSecAttrAccount as String: ProcessInfo.processInfo.environment["USER"] ?? NSUserName(),
+                            kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+    var item: CFTypeRef?
+    let found = SecItemCopyMatching(q as CFDictionary, &item)
+    guard found != errSecItemNotFound else { return done(.failure(LimitError(text: "no login found"))) }
+    guard found == errSecSuccess, let data = item as? Data,
+          let creds = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let token = (creds["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String else {
+        return done(.failure(LimitError(text: "can't read login (\(found))")))
+    }
+    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 10)
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+    URLSession.shared.dataTask(with: req) { body, resp, _ in
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200, let body, let j = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            return done(.failure(LimitError(text: status == 401 ? "login expired, open Claude Code once" : "unavailable (\(status))")))
+        }
+        let names = [("five_hour", "5-hour"), ("seven_day", "Weekly"), ("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")]
+        done(.success(names.compactMap { key, name in
+            guard let l = j[key] as? [String: Any], let used = l["utilization"] as? Double else { return nil }
+            let at = (l["resets_at"] as? String).flatMap { isoFrac.date(from: $0) ?? isoPlain.date(from: $0) }
+            return Limit(name: name, used: used, resets: at)
+        }))
+    }.resume()
+}
+
 // MARK: app
 
 final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate {
@@ -437,6 +486,24 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
     var wasWorking = false, agentStep = "", otherActivity = ""
     var pending: [(id: String, title: String, input: [String: Any])] = []
     var lastUsage: [String] = []
+    let usageLabel: NSTextField = {
+        let f = NSTextField(labelWithString: ""); f.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        f.translatesAutoresizingMaskIntoConstraints = false
+        return f
+    }()
+    lazy var usagePopover: NSPopover = {
+        let vc = NSViewController(); vc.view = NSView(); vc.view.addSubview(usageLabel)
+        NSLayoutConstraint.activate([
+            usageLabel.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 14),
+            usageLabel.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -14),
+            usageLabel.topAnchor.constraint(equalTo: vc.view.topAnchor, constant: 12),
+            usageLabel.bottomAnchor.constraint(equalTo: vc.view.bottomAnchor, constant: -12),
+        ])
+        let p = NSPopover(); p.contentViewController = vc; p.behavior = .transient
+        return p
+    }()
+    let resetFormat: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE HH:mm"; return f }()
+    var limits: [String: Result<[Limit], LimitError>] = [:], limitsFetched = Date.distantPast   // per account label
     let headroom: CGFloat = 230
     let sizes: [(String, CGFloat)] = [("Small", 160), ("Medium", 240), ("Large", 340)]
     var height: CGFloat { CGFloat(UserDefaults.standard.object(forKey: "height") as? Double ?? 240) }
@@ -458,6 +525,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         view = PetView(sprite: sprite)
         view.onClick = { [weak self] in self?.toggleInput() }
         view.onMoved = { [weak self] in self?.window.saveFrame(usingName: "pet") }
+        view.onRightClick = { [weak self] in self?.toggleUsagePanel() }
         window.contentView = view
         input.isHidden = true; input.delegate = self
         input.focusRingType = .none; input.bezelStyle = .roundedBezel; input.font = .systemFont(ofSize: 12)
@@ -641,13 +709,55 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDel
         refreshPill()
         var lines = rows.map { "\($0.label): \(shortCount($0.usage.output)) out · \(shortCount($0.usage.input)) in · \($0.usage.sessions) sessions" }
         if let a = act, a.context > 0 { lines.append("Context (\(a.project)): \(shortCount(a.context))") }
-        guard lines != lastUsage else { return }
+        let changed = lines != lastUsage
         lastUsage = lines
+        if usagePopover.isShown { fetchLimits(); updateUsagePanel() }
+        guard changed else { return }
         let total = rows.reduce(0) { $0 + $1.usage.output }
         status.button?.title = total > 0 ? "✦ \(shortCount(total))" : "✦"
         usageItems.forEach { status.menu?.removeItem($0) }
         usageItems = lines.map { NSMenuItem(title: $0, action: nil, keyEquivalent: "") }
         for (i, it) in usageItems.enumerated() { status.menu?.insertItem(it, at: 1 + i) }
+    }
+
+    // usage panel (right-click the pet): plan limits, today's tokens per account, context, what's running now
+    func toggleUsagePanel() {
+        if usagePopover.isShown { usagePopover.close(); return }
+        fetchLimits(); updateUsagePanel()
+        NSApp.activate(ignoringOtherApps: true)
+        usagePopover.show(relativeTo: view.spriteRect, of: view, preferredEdge: .minX)
+    }
+    func fetchLimits() {   // at most once a minute; accounts in parallel, off pollQueue (keychain prompt, network)
+        guard Date().timeIntervalSince(limitsFetched) > 60 else { return }
+        limitsFetched = Date()
+        for a in accounts {
+            DispatchQueue.global(qos: .utility).async {
+                planLimits(a.dir) { r in DispatchQueue.main.async { self.limits[a.label] = r; if self.usagePopover.isShown { self.updateUsagePanel() } } }
+            }
+        }
+    }
+    func limitLines() -> [String] {
+        accounts.flatMap { a -> [String] in
+            let head = accounts.count > 1 ? [a.label] : []
+            switch limits[a.label] {
+            case nil: return head + ["  loading…"]
+            case .failure(let e): return head + ["  \(e.text)"]
+            case .success(let ls):
+                return head + ls.map { l in
+                    let n = 18, filled = min(n, Int((l.used / 100 * Double(n)).rounded()))
+                    let bar = String(repeating: "█", count: filled) + String(repeating: "░", count: n - filled)
+                    let left = l.name.padding(toLength: 7, withPad: " ", startingAt: 0)
+                    let pct = String(format: "%3d%%", Int(l.used.rounded()))
+                    return "  \(left) \(bar) \(pct)" + (l.resets.map { "  resets \(resetFormat.string(from: $0))" } ?? "")
+                }
+            }
+        }
+    }
+    func updateUsagePanel() {
+        let now = statusPill.stringValue.isEmpty ? "idle" : statusPill.stringValue
+        usageLabel.stringValue = (["Plan limits"] + limitLines() + ["", "Today's tokens"]
+            + (lastUsage.isEmpty ? ["  no activity yet"] : lastUsage.map { "  " + $0 })
+            + ["", "Talking to: \(agent.target.name)", "Now: \(now)"]).joined(separator: "\n")
     }
 
     // menu

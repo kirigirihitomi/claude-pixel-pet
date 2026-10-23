@@ -12,11 +12,13 @@ A small pixel-art Claude that lives on your macOS desktop. You can chat with it,
   Under the hood this is the same stream-json protocol the IDE extensions use: one long-lived `claude -p --input-format stream-json --output-format stream-json --permission-prompt-tool stdio` process per attached session.
   Attaching to a session that is still open in a terminal or IDE forks it: both continue from the same history.
 - **Claude Code activity.** While a session is working, a small label above the pet's head shows the project and the current step (for example `my-app: Bash · Run tests`). When a task that ran for more than 20 seconds finishes, the pet tells you.
-- **Open in Terminal.** Lists the Claude Code sessions from the last 7 days (project, title, time). Pick one and Terminal opens in that directory and runs `claude --resume` for it. - **Usage.** The menu-bar ✦ shows today's output tokens. The menu breaks usage down per account (output, input including cache, number of sessions) and shows the context size of the latest session.
+- **Open in Terminal.** Lists the Claude Code sessions from the last 7 days (project, title, time). Pick one and Terminal opens in that directory and runs `claude --resume` for it.
+- **Usage.** The menu-bar ✦ shows today's output tokens. The menu breaks usage down per account (output, input including cache, number of sessions) and shows the context size of the latest session.
+- **Usage panel.** Right-click the pet for a panel with your plan limits per account (5-hour and weekly, with Opus / Sonnet when your plan has them), the same percentages and reset times as `/usage` in Claude Code, plus today's tokens and what is running now. The first time, macOS asks whether ClaudePet may read Claude Code's login from the keychain; choose Always Allow.
 - **Pixel animation.** She blinks every few seconds. Now and then she reads her book, and very rarely she yawns. She smiles when a Claude Code task finishes and looks surprised when a permission card pops up. Every pose is a full pixel-art frame with only the eyes and mouth changed, so nothing gets stretched.
 - Drag the pet to move it. The transparent area around the character is click-through. Sizes are Small, Medium and Large. It can stay on top, shows on every desktop, and has no Dock icon.
 
-Activity and usage come from reading the local transcripts in `~/.claude/projects/**/*.jsonl`. Nothing is sent anywhere. The only network traffic is the chat, which goes through your own `claude` CLI.
+Activity and usage come from reading the local transcripts in `~/.claude/projects/**/*.jsonl`. Nothing is sent anywhere. Network traffic is the chat, which goes through your own `claude` CLI, and, while the usage panel is open, at most one request a minute per account to `api.anthropic.com/api/oauth/usage` (the endpoint Claude Code's own `/usage` calls) with that account's login. The token is read from the keychain and not stored anywhere else. That endpoint is undocumented, so the plan limits can stop working after a Claude Code update.
 
 ## Build
 
